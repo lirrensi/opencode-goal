@@ -12,8 +12,6 @@ type Goal = {
   status: GoalStatus
   createdAt: number
   updatedAt: number
-  agent?: string
-  model?: { providerID: string; modelID: string }
   tokenBudget?: number
   tokensUsed: number
   timeUsedMs: number
@@ -22,7 +20,6 @@ type Goal = {
   lastContinuationMessageID?: string
   lastContinuationHadToolCalls?: boolean
   continuationQueuedAt?: number
-  suppressContinuationUntil?: number
   suppressNextIdleContinuation?: boolean
   budgetWrapupSent?: boolean
   accountedAssistantTokens?: Record<string, number>
@@ -256,7 +253,6 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
       })
       return
     }
-    if (goal.suppressContinuationUntil && goal.suppressContinuationUntil > now()) return
     if (goal.lastContinuationMessageID && goal.lastContinuationHadToolCalls === false) return
 
     const budgetLimited = typeof goal.tokenBudget === "number" && goal.tokensUsed >= goal.tokenBudget
@@ -340,25 +336,11 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
       let prompt = ""
 
       if (parsed.kind === "help") {
-        await updateState((state) => {
-          const stored = state.goals[key(sessionID)]
-          if (stored?.status === "active") {
-            stored.suppressContinuationUntil = now() + 5000
-            stored.suppressNextIdleContinuation = true
-          }
-        })
         prompt = managementPrompt(helpText(parsed.reason), await getGoal(sessionID))
         await showToast("Goal help", "info")
       }
 
       if (parsed.kind === "status") {
-        await updateState((state) => {
-          const stored = state.goals[key(sessionID)]
-          if (stored?.status === "active") {
-            stored.suppressContinuationUntil = now() + 5000
-            stored.suppressNextIdleContinuation = true
-          }
-        })
         const goal = await getGoal(sessionID)
         prompt = managementPrompt("Goal status:", goal)
         await showToast(goal ? `Goal is ${goal.status}` : "No active goal", "info")
@@ -503,22 +485,6 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
           await queueContinuation(sessionID)
         }
 
-        if (type === "tui.command.execute" && properties.command === "session.interrupt") {
-          const state = await readState()
-          await Promise.all(
-            Object.values(state.goals)
-              .filter((goal) => goal.status === "active")
-              .map((goal) =>
-                updateState((latest) => {
-                  const stored = latest.goals[key(goal.sessionID)]
-                  if (!stored || stored.status !== "active") return
-                  stored.status = "paused"
-                  stored.updatedAt = now()
-                  stored.activeSince = undefined
-                }),
-              ),
-          )
-        }
       } catch (error) {
         console.error(`[goal-plugin] Unhandled error processing event "${(event as any)?.type}":`, error)
         try { await showToast("Goal plugin error — check console", "error") } catch {}
