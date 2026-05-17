@@ -1,6 +1,7 @@
 # opencode-plugin-goal
 
-Persistent `/goal` workflows for OpenCode.
+> **Fork of** [watzon/opencode-goal](https://github.com/watzon/opencode-goal) — persistent `/goal` workflows for OpenCode.  
+> Original author: [Watson](https://github.com/watzon) — all credit for the architecture and design.
 
 `opencode-plugin-goal` emulates Codex-style persistent goals in OpenCode. It registers a `/goal` slash command through OpenCode's plugin `config` hook, persists per-session goal state, exposes goal tools to the model, and queues conservative continuation turns while a goal remains active.
 
@@ -57,6 +58,18 @@ Goal state is stored under `.opencode/goals/state.json` in the active project di
 - The `event` hook watches session idle/status and message events to account usage and queue continuation turns.
 
 Continuation is intentionally conservative. If a continuation turn produces no tool calls, the plugin does not keep auto-continuing, which avoids runaway self-chat loops.
+
+## Fixes applied in this fork
+
+This fork restores the plugin to a working state with the following fixes:
+
+- **Graceful state recovery** — Corrupted or unexpected state files are handled properly with clear logging instead of silently returning malformed state.
+- **State file cleanup** — When all goals are cleared, the state file is deleted instead of writing an empty file.
+- **Continuation housekeeping** — Pending and in-flight continuation tracking is properly cleaned up when a goal is completed, blocked, or cleared, preventing stale continuation loops.
+- **No continuation leak on inactive goals** — Continuation queue is cleaned up when a goal is no longer active, avoiding unnecessary event processing.
+- **Compaction safety** — Continuation is suppressed after session compaction, preventing an immediate duplicate continuation turn.
+- **Event handler crash protection** — The entire event handler is wrapped in a try/catch with error logging and a toast notification, so an unexpected error in one event doesn't take down the plugin.
+- **Removed incorrect agent pinning** — The `/goal` command no longer incorrectly pins to the `build` agent, allowing the default routing to work.
 
 ## Development
 

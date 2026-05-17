@@ -182,15 +182,28 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
     try {
       const raw = await fs.readFile(stateFile, "utf8")
       const parsed = JSON.parse(raw) as State
-      if (!parsed || parsed.version !== 1 || !parsed.goals) return { ...EMPTY_STATE, goals: {} }
+      if (!parsed || parsed.version !== 1 || !parsed.goals) {
+        console.warn(`[goal-plugin] State file has unexpected format, resetting`)
+        return { ...EMPTY_STATE }
+      }
       return parsed
     } catch (error: any) {
-      if (error?.code === "ENOENT") return { ...EMPTY_STATE, goals: {} }
+      if (error?.code === "ENOENT") return { ...EMPTY_STATE }
+      if (error instanceof SyntaxError) {
+        console.error(`[goal-plugin] Corrupted state file: ${error.message}`)
+        return { ...EMPTY_STATE }
+      }
+      console.error(`[goal-plugin] Error reading state:`, error)
       throw error
     }
   }
 
   async function writeState(state: State) {
+    const hasLiveGoals = Object.values(state.goals).some((g) => g.status !== "cleared")
+    if (!hasLiveGoals) {
+      try { await fs.unlink(stateFile) } catch { /* already gone — that's fine */ }
+      return
+    }
     await ensureDir(stateFile)
     const tmp = `${stateFile}.${process.pid}.${Date.now()}.tmp`
     await fs.writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8")
@@ -232,7 +245,10 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
     continuationPending.set(sessionID, current)
 
     const goal = await getGoal(sessionID)
-    if (!goal || goal.status !== "active") return
+    if (!goal || goal.status !== "active") {
+      continuationPending.delete(sessionID)
+      return
+    }
     if (goal.suppressNextIdleContinuation) {
       await updateState((state) => {
         const stored = state.goals[key(sessionID)]
@@ -278,7 +294,6 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
       config.command.goal ??= {
         template: GOAL_COMMAND_TEMPLATE,
         description: "persistent goal workflow: create, status, pause, resume, clear",
-        agent: "build",
       }
     },
 
@@ -310,6 +325,8 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
             return { ...goal }
           })
           if (!updated) return "No goal exists for this session."
+          continuationPending.delete(context.sessionID)
+          continuationInFlight.delete(context.sessionID)
           return `Goal marked ${updated.status}.\n${statusLine(updated)}`
         },
       }),
@@ -384,6 +401,8 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
           stored.activeSince = undefined
           return { ...stored }
         })
+        continuationPending.delete(sessionID)
+        continuationInFlight.delete(sessionID)
         prompt = managementPrompt(goal ? "Goal cleared." : "No goal to clear.", goal)
         await showToast(goal ? "Goal cleared" : "No goal to clear", "info")
       }
@@ -423,77 +442,86 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
     async "experimental.session.compacting"(input, output) {
       const goal = await getGoal(input.sessionID)
       if (!goal || goal.status !== "active") return
+      await updateState((state) => {
+        const stored = state.goals[key(input.sessionID)]
+        if (stored) stored.suppressNextIdleContinuation = true
+      })
       output.context.push(`Active persistent OpenCode goal to preserve through compaction:\n${statusLine(goal)}`)
     },
 
     async event({ event }) {
-      const anyEvent = event as any
-      const type = anyEvent.type
-      const properties = anyEvent.properties ?? anyEvent
-      const sessionID = properties.sessionID ?? properties.info?.sessionID ?? properties.part?.sessionID
+      try {
+        const anyEvent = event as any
+        const type = anyEvent.type
+        const properties = anyEvent.properties ?? anyEvent
+        const sessionID = properties.sessionID ?? properties.info?.sessionID ?? properties.part?.sessionID
 
-      if (type === "message.updated" && sessionID && properties.info?.role === "assistant") {
-        await updateState((state) => {
-          const goal = state.goals[key(sessionID)]
-          if (!goal || goal.status === "cleared") return
-          const total = properties.info.tokens?.total
-          const fallback = (properties.info.tokens?.input ?? 0) + (properties.info.tokens?.output ?? 0) + (properties.info.tokens?.reasoning ?? 0)
-          const tokens = typeof total === "number" ? total : fallback
-          const messageID = properties.info.id
-          goal.accountedAssistantTokens ??= {}
-          const previous = goal.accountedAssistantTokens[messageID] ?? 0
-          if (tokens > previous) {
-            goal.tokensUsed += tokens - previous
-            goal.accountedAssistantTokens[messageID] = tokens
-          }
-          if (goal.activeSince) {
-            const current = now()
-            goal.timeUsedMs += Math.max(0, current - goal.activeSince)
-            goal.activeSince = current
-          }
-          goal.lastAssistantMessageID = properties.info.id
-          if (goal.continuationQueuedAt && (!goal.lastContinuationMessageID || goal.lastContinuationHadToolCalls !== true)) {
-            goal.lastContinuationMessageID = properties.info.id
-            goal.lastContinuationHadToolCalls = false
-          }
-          goal.updatedAt = now()
-        })
-      }
-
-      if (type === "message.part.updated" && sessionID && properties.part?.type === "tool") {
-        await updateState((state) => {
-          const goal = state.goals[key(sessionID)]
-          if (!goal || goal.status !== "active") return
-          if (goal.lastContinuationMessageID && properties.part.messageID === goal.lastContinuationMessageID) {
-            goal.lastContinuationHadToolCalls = true
+        if (type === "message.updated" && sessionID && properties.info?.role === "assistant") {
+          await updateState((state) => {
+            const goal = state.goals[key(sessionID)]
+            if (!goal || goal.status === "cleared") return
+            const total = properties.info.tokens?.total
+            const fallback = (properties.info.tokens?.input ?? 0) + (properties.info.tokens?.output ?? 0) + (properties.info.tokens?.reasoning ?? 0)
+            const tokens = typeof total === "number" ? total : fallback
+            const messageID = properties.info.id
+            goal.accountedAssistantTokens ??= {}
+            const previous = goal.accountedAssistantTokens[messageID] ?? 0
+            if (tokens > previous) {
+              goal.tokensUsed += tokens - previous
+              goal.accountedAssistantTokens[messageID] = tokens
+            }
+            if (goal.activeSince) {
+              const current = now()
+              goal.timeUsedMs += Math.max(0, current - goal.activeSince)
+              goal.activeSince = current
+            }
+            goal.lastAssistantMessageID = properties.info.id
+            if (goal.continuationQueuedAt && (!goal.lastContinuationMessageID || goal.lastContinuationHadToolCalls !== true)) {
+              goal.lastContinuationMessageID = properties.info.id
+              goal.lastContinuationHadToolCalls = false
+            }
             goal.updatedAt = now()
-          }
-        })
-      }
+          })
+        }
 
-      if (type === "session.status" && sessionID && properties.status?.type === "idle") {
-        await queueContinuation(sessionID)
-      }
+        if (type === "message.part.updated" && sessionID && properties.part?.type === "tool") {
+          await updateState((state) => {
+            const goal = state.goals[key(sessionID)]
+            if (!goal || goal.status !== "active") return
+            if (goal.lastContinuationMessageID && properties.part.messageID === goal.lastContinuationMessageID) {
+              goal.lastContinuationHadToolCalls = true
+              goal.updatedAt = now()
+            }
+          })
+        }
 
-      if (type === "session.idle" && sessionID) {
-        await queueContinuation(sessionID)
-      }
+        if (type === "session.status" && sessionID && properties.status?.type === "idle") {
+          await queueContinuation(sessionID)
+        }
 
-      if (type === "tui.command.execute" && properties.command === "session.interrupt") {
-        const state = await readState()
-        await Promise.all(
-          Object.values(state.goals)
-            .filter((goal) => goal.status === "active")
-            .map((goal) =>
-              updateState((latest) => {
-                const stored = latest.goals[key(goal.sessionID)]
-                if (!stored || stored.status !== "active") return
-                stored.status = "paused"
-                stored.updatedAt = now()
-                stored.activeSince = undefined
-              }),
-            ),
-        )
+        if (type === "session.idle" && sessionID) {
+          await queueContinuation(sessionID)
+        }
+
+        if (type === "tui.command.execute" && properties.command === "session.interrupt") {
+          const state = await readState()
+          await Promise.all(
+            Object.values(state.goals)
+              .filter((goal) => goal.status === "active")
+              .map((goal) =>
+                updateState((latest) => {
+                  const stored = latest.goals[key(goal.sessionID)]
+                  if (!stored || stored.status !== "active") return
+                  stored.status = "paused"
+                  stored.updatedAt = now()
+                  stored.activeSince = undefined
+                }),
+              ),
+          )
+        }
+      } catch (error) {
+        console.error(`[goal-plugin] Unhandled error processing event "${(event as any)?.type}":`, error)
+        try { await showToast("Goal plugin error — check console", "error") } catch {}
       }
     },
   }
