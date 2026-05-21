@@ -204,6 +204,7 @@ export const GoalPlugin: Plugin = async ({ client, worktree, directory }) => {
     await ensureDir(stateFile)
     const tmp = `${stateFile}.${process.pid}.${Date.now()}.tmp`
     await fs.writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8")
+    await fs.unlink(stateFile).catch(() => {})
     await fs.rename(tmp, stateFile)
   }
 
